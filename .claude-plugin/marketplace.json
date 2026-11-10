@@ -1,0 +1,11 @@
+{
+  "name": "yoto-mcp",
+  "owner": { "name": "earchibald" },
+  "plugins": [
+    {
+      "name": "yoto",
+      "source": "./",
+      "description": "Yoto MYO cards for Claude: plan-then-apply edits, interactive-card compiler, TTS prompts, icon chooser."
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "yoto": {
+      "command": "uvx",
+      "args": ["--from", "${CLAUDE_PLUGIN_ROOT}", "yoto-mcp", "serve"]
+    }
+  }
+}

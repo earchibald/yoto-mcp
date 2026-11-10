@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__.*yoto.*__yoto_card_apply",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/check_apply.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

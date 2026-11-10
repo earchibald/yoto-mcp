@@ -1,0 +1,18 @@
+{
+  "name": "yoto",
+  "version": "0.2.0",
+  "description": "Read and safely edit Yoto MYO playlists and interactive cards: plan-then-apply edits with backups, a story-graph compiler with a player simulator, spoken prompts, and 16x16 icon drawing and choosing.",
+  "author": {
+    "name": "earchibald"
+  },
+  "homepage": "https://github.com/earchibald/yoto-mcp",
+  "repository": "https://github.com/earchibald/yoto-mcp",
+  "license": "MIT",
+  "keywords": [
+    "yoto",
+    "mcp",
+    "audio",
+    "kids"
+  ],
+  "icon": ".claude-plugin/icon.png"
+}
