@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP, Image
+from mcp.server.fastmcp import Context, FastMCP, Image
 from mcp.types import ToolAnnotations
 
-from . import cards, icons, vault
+from . import cards, chooser, icons, reference, story, vault, workflows
 from .session import Session
 
 INSTRUCTIONS = """\
@@ -23,6 +24,10 @@ Tools for the user's Yoto MYO playlists and interactive cards.
   yoto_media_import before reusing it on this account's cards.
 - To draw an icon, write a 16×16 character grid with a palette (yoto_icon_render) or start from
   yoto_icon_glyph; look at the preview it returns before offering the icon.
+- For interactive cards, write a story graph (yoto://schema/story-graph) and use
+  yoto_story_compile; it simulates the card and returns a plan. The templates
+  (yoto_template_book_selector, yoto_template_title_tracks) do the Hilo patterns in one call.
+- yoto_icon_select is for the icon chooser page only; don't call it yourself.
 """
 
 mcp = FastMCP("yoto", instructions=INSTRUCTIONS)
@@ -290,13 +295,7 @@ def yoto_icon_from_image(
     return [json.dumps(data, indent=1), out[1]]
 
 
-@mcp.tool(annotations=UPLOAD)
-def yoto_icon_upload(icon: str, account: str | None = None, auto_convert: bool = False) -> dict[str, Any]:
-    """Upload an icon: the sha256 of a rendered icon, or a local PNG/GIF path. Returns its yoto:# ref.
-
-    Without auto_convert the file must be exactly 16×16 RGBA PNG, so Yoto stores the pixels as drawn.
-    Use the ref in a set_icon op.
-    """
+def _upload_icon(icon: str, account: str | None = None, auto_convert: bool = False) -> dict[str, Any]:
     s = session()
     acct, api = s.account(account)
     hit = icons.cached(icon) if len(icon) == 64 and all(c in "0123456789abcdef" for c in icon) else None
@@ -316,6 +315,16 @@ def yoto_icon_upload(icon: str, account: str | None = None, auto_convert: bool =
     up = api.upload_icon(png, filename, auto_convert=auto_convert)
     s.note_owned(acct.sub, up["ref"])
     return {"ref": up["ref"], "new": up["new"], "account": acct.name}
+
+
+@mcp.tool(annotations=UPLOAD)
+def yoto_icon_upload(icon: str, account: str | None = None, auto_convert: bool = False) -> dict[str, Any]:
+    """Upload an icon: the sha256 of a rendered icon, or a local PNG/GIF path. Returns its yoto:# ref.
+
+    Without auto_convert the file must be exactly 16×16 RGBA PNG, so Yoto stores the pixels as drawn.
+    Use the ref in a set_icon op.
+    """
+    return _upload_icon(icon, account, auto_convert)
 
 
 @mcp.tool(annotations=READ)
@@ -340,6 +349,357 @@ def yoto_cover_upload(path: str, account: str | None = None) -> dict[str, Any]:
     if not ctype:
         raise ValueError("Cover art must be a JPEG, PNG, GIF or WebP file.")
     return api.upload_cover(f.read_bytes(), ctype)
+
+
+# ------------------------------------------------------------------ spoken prompts
+
+
+@mcp.tool(annotations=UPLOAD)
+def yoto_tts(
+    text: str,
+    account: str | None = None,
+    voice: str | None = None,
+    model: str | None = None,
+    pronunciations: dict[str, str] | None = None,
+    check: bool = True,
+) -> dict[str, Any]:
+    """Speak a short prompt on this machine, check it with speech-to-text, and upload it.
+
+    `text` is what the card displays; the pronunciation map rewrites it for speaking
+    ("Hilo" → "High-low" by default). Returns media (ref, duration, …) to use as a track's audio,
+    plus the transcript and a match score. Listen again if the match is low.
+    """
+    return workflows.prompt_media(session(), text, account, voice, model, pronunciations, check)
+
+
+# ------------------------------------------------------------------ interactive cards
+
+GRAPH_HELP = """\
+A graph: {"start"?: id, "nodes": [{"id", "type": "choice"|"segment"|"end", "title",
+"tracks": [{"title", "audio": "yoto:#…" | media | asset name, "icon"?}], "next"?: id|"stop",
+"left"?: id, "right"?: id}], "assets"?: {name: media}, "expect"?: [{"presses": ["right", "left"],
+"plays": [node ids]}]}. A choice waits for a button; a segment plays on to `next`; an end stops.
+Node order is chapter (dial) order, with the start node first. Full schema: yoto://schema/story-graph.
+"""
+
+
+@mcp.tool(
+    annotations=LOCAL,
+    description="Check a story graph for unreachable nodes, dead ends, missing "
+    "targets and endless loops. Writes nothing.\n\n" + GRAPH_HELP,
+)
+def yoto_story_validate(graph: dict[str, Any]) -> dict[str, Any]:
+    return story.validate(graph)
+
+
+@mcp.tool(
+    annotations=READ,
+    description="Compile a story graph into an interactive card, walk it like the "
+    "player would, and (if the walk is clean) return a plan writing it to `card` (a title, or "
+    '"new"). Show the user the simulator result and the diff, then yoto_card_apply.\n\n' + GRAPH_HELP,
+)
+def yoto_story_compile(
+    graph: dict[str, Any],
+    title: str,
+    card: str = "new",
+    account: str | None = None,
+    config: dict[str, Any] | None = None,
+    cover: str | None = None,
+) -> dict[str, Any]:
+    return workflows.compile_plan(session(), graph, title, card, account, config, cover)
+
+
+@mcp.tool(annotations=READ)
+def yoto_story_simulate(
+    presses: list[str],
+    card: str | None = None,
+    graph: dict[str, Any] | None = None,
+    account: str | None = None,
+) -> dict[str, Any]:
+    """Replay button presses against a card (by title) or a draft graph and list what plays.
+
+    `presses` is a list of "left", "right" or "end" (let the track finish). After the presses run
+    out the card plays on until it stops or waits for a button. Also returns the full walk report.
+    """
+    return workflows.simulate(session(), card, graph, presses, account)
+
+
+@mcp.tool(annotations=READ)
+def yoto_story_from_card(card: str, account: str | None = None) -> dict[str, Any]:
+    """Turn a card's events back into a story graph (one node per chapter) for editing and recompiling."""
+    _acct, _api, entry, doc, owned = session().read(card, account)
+    return {"card": entry.title, "owned": owned, "graph": story.from_card(doc), "mermaid": story.mermaid(doc)}
+
+
+@mcp.tool(annotations=UPLOAD)
+def yoto_template_book_selector(
+    source_card: str,
+    subtitles: dict[str, str] | None = None,
+    account: str | None = None,
+    title: str | None = None,
+    target: str | None = None,
+    voice: str | None = None,
+    pattern: str = r"^Book (\d+)\b",
+    prompt_text: str = "For book {n}, click left dial. For other books, click right dial.",
+    prompt_icons: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Build a "choose a book" interactive card from a linear multi-book card, as a plan.
+
+    Right cycles the books' prompts, left picks one: it announces "<Series> Book N: <subtitle>"
+    and plays that book and the ones after it. Left/right step tracks while a book plays.
+    Generates and uploads the spoken prompts (only the upload writes anything). `subtitles` maps
+    book number to subtitle. `target` is the card to rebuild (default: the existing
+    "<source> (Choose a Book)" if there is one, else a new card). Use the source card's owner account.
+    """
+    return workflows.book_selector(
+        session(), source_card, subtitles, account, title, target, voice, pattern, prompt_text, prompt_icons
+    )
+
+
+@mcp.tool(annotations=UPLOAD)
+def yoto_template_title_tracks(
+    card: str,
+    subtitles: dict[str, str] | None = None,
+    account: str | None = None,
+    pattern: str = r"^Book (\d+)\b",
+    intro: str | None = "intro",
+    voice: str | None = None,
+) -> dict[str, Any]:
+    """Plan inserting a spoken "<Series> Book N: <subtitle>" title track before each book of a linear card.
+
+    Also regenerates the `intro` chapter's audio with recalculated track numbers ("Book 4, track 2.").
+    Books that already have a title track are left alone. Returns a plan; apply it after the user agrees.
+    """
+    return workflows.title_tracks(session(), card, subtitles, account, pattern, intro, voice)
+
+
+# ------------------------------------------------------------------ icon chooser
+
+CHOOSER_URI = "ui://yoto/icon-chooser"
+_choosers = chooser.ChooserServer()
+
+
+def _client_has_apps(ctx: Context | None) -> bool:
+    try:
+        params = ctx.session.client_params if ctx else None
+    except Exception:  # noqa: BLE001
+        return False
+    if params is None:
+        return False
+    caps = params.capabilities
+    blobs = [getattr(caps, "experimental", None) or {}, getattr(caps, "model_extra", None) or {}]
+    extensions = (getattr(caps, "model_extra", None) or {}).get("extensions") or {}
+    blobs.append(extensions)
+    return any("io.modelcontextprotocol/ui" in b or "ui" in b for b in blobs)
+
+
+def _open_chooser(
+    card: str, generated: dict[str, list[str]] | None, per_track: bool, account: str | None
+) -> chooser.Chooser:
+    s = session()
+    acct, api, entry, doc, owned = s.read(card, account)
+    if not owned:
+        raise PermissionError(f"{entry.title!r} belongs to another account; open the chooser from its owner.")
+    try:
+        playable = api.get_playable(entry.card_id)
+    except Exception:  # noqa: BLE001 - current icons just won't show
+        playable = {}
+    public = s._public_icons(api)
+    mine = api.list_icons("me")
+    s.note_owned(acct.sub, *[f"yoto:#{i['mediaId']}" for i in public + mine if i.get("mediaId")])
+    rows = chooser.build_rows(doc, playable, public, mine, generated, per_track)
+    cid, token = _choosers.new_id()
+    ch = chooser.Chooser(cid, token, acct.name, entry.title, entry.card_id, rows)
+    _choosers.add(ch, public, mine)
+    return ch
+
+
+def _chooser_result(ch: chooser.Chooser) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "chooser_id": ch.chooser_id,
+        "card": ch.card,
+        "done": ch.done,
+        "selections": list(ch.selections.values()),
+        "requests": ch.requests,
+    }
+    if ch.selections:
+        ops, uploaded = chooser.selections_to_ops(
+            list(ch.selections.values()), lambda sha: _upload_icon(sha, ch.account)["ref"]
+        )
+        p = session().make_plan(ch.card, ops, ch.account)
+        out["plan"] = p.public()
+        out["uploaded_icons"] = uploaded
+    if ch.requests:
+        out["next"] = (
+            "The user asked for new candidates. Draw them with yoto_icon_render, then reopen the "
+            "chooser with generated={chapter_key: [sha256, …]}."
+        )
+    elif ch.selections:
+        out["next"] = "Show the user the plan's diff, then yoto_card_apply."
+    return out
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
+    meta={"ui": {"resourceUri": CHOOSER_URI}, "ui/resourceUri": CHOOSER_URI},
+)
+async def yoto_icon_chooser(
+    card: str,
+    generated: dict[str, list[str]] | None = None,
+    per_track: bool = False,
+    account: str | None = None,
+    mode: str = "auto",
+    wait_minutes: float = 15,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Open an icon picker over a card: one row per chapter, with Yoto's matching icons, the account's own
+    icons and any icons you drew (`generated`: {chapter_key or "*": [sha256 from yoto_icon_render]}).
+
+    In Claude Code it opens in the browser and returns when the user presses Done, with their picks as a
+    plan of set_icon ops (generated icons are uploaded first). In an MCP Apps host it renders inline and
+    returns at once; call yoto_icon_chooser_result after the user says they're done.
+    """
+    import asyncio
+    import webbrowser
+
+    ch = _open_chooser(card, generated, per_track, account)
+    inline = mode == "inline" or (mode == "auto" and _client_has_apps(ctx))
+    if inline:
+        return {
+            **ch.state(),
+            "mode": "inline",
+            "next": "When the user says they're done, call yoto_icon_chooser_result.",
+        }
+    url = _choosers.url(ch)
+    webbrowser.open(url)
+    deadline = time.monotonic() + wait_minutes * 60
+    while not ch.done and time.monotonic() < deadline:
+        await asyncio.sleep(0.5)
+    out = _chooser_result(ch)
+    out["mode"] = "browser"
+    out["url"] = url
+    if not ch.done:
+        out["note"] = (
+            "The user hasn't pressed Done yet. The page stays open; call yoto_icon_chooser_result "
+            "later to collect the picks."
+        )
+    return out
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False))
+def yoto_icon_select(
+    chooser_id: str,
+    selections: list[dict[str, Any]] | None = None,
+    requests: list[dict[str, Any]] | None = None,
+    done: bool = False,
+) -> dict[str, Any]:
+    """Save picks from the icon chooser page. Called by the page only, not by Claude."""
+    ch = _choosers.choosers.get(chooser_id)
+    if ch is None:
+        raise LookupError("That chooser is closed. Open a new one with yoto_icon_chooser.")
+    ch.record(selections, requests, done)
+    return {"saved": len(ch.selections), "done": ch.done}
+
+
+@mcp.tool(annotations=READ)
+def yoto_icon_chooser_result(chooser_id: str) -> dict[str, Any]:
+    """The picks made so far in an icon chooser, as a plan of set_icon ops, plus any requests for new icons."""
+    ch = _choosers.choosers.get(chooser_id)
+    if ch is None:
+        raise LookupError("No chooser with that id in this session.")
+    return _chooser_result(ch)
+
+
+# ------------------------------------------------------------------ resources
+
+
+@mcp.resource(
+    CHOOSER_URI,
+    name="icon-chooser",
+    mime_type="text/html;profile=mcp-app",
+    meta={"ui": {"csp": {"resourceDomains": ["https://*.yotoplay.com"]}, "prefersBorder": True}},
+)
+def chooser_page() -> str:
+    return chooser.PAGE.read_text()
+
+
+@mcp.resource("yoto://schema/story-graph", name="story-graph-schema", mime_type="application/json")
+def story_graph_schema() -> str:
+    return json.dumps(story.GRAPH_SCHEMA, indent=1)
+
+
+@mcp.resource("yoto://docs/interactive", name="interactive-reference", mime_type="text/markdown")
+def interactive_docs() -> str:
+    return reference.INTERACTIVE
+
+
+@mcp.resource("yoto://card/{card_id}", name="card", mime_type="application/json")
+def card_resource(card_id: str) -> str:
+    s = session()
+    _acct, api = s.account(None)
+    doc = api.get_card(card_id).card
+    return json.dumps({k: v for k, v in doc.items() if k != "userId"}, indent=1)
+
+
+@mcp.resource("yoto://card/{card_id}/outline", name="card-outline", mime_type="text/markdown")
+def card_outline_resource(card_id: str) -> str:
+    _acct, api = session().account(None)
+    return cards.outline_markdown(api.get_card(card_id).card)
+
+
+@mcp.resource("yoto://card/{card_id}/graph", name="card-graph", mime_type="text/vnd.mermaid")
+def card_graph_resource(card_id: str) -> str:
+    _acct, api = session().account(None)
+    return story.mermaid(api.get_card(card_id).card)
+
+
+@mcp.resource("yoto://icons/{sha256}", name="icon", mime_type="application/json")
+def icon_resource(sha256: str) -> str:
+    hit = icons.cached(sha256)
+    if not hit:
+        raise LookupError("No rendered icon with that sha256.")
+    png, meta = hit
+    import base64
+
+    return json.dumps({**meta, "png_base64": base64.b64encode(png).decode()})
+
+
+# ------------------------------------------------------------------ prompts
+
+
+@mcp.prompt(name="book-selector", description="Build a choose-a-book interactive card from a linear card.")
+def book_selector_prompt(source_card: str, subtitles: str = "", voice: str = "") -> str:
+    return (
+        f"Build a choose-a-book interactive card from the Yoto card {source_card!r}.\n"
+        f"Subtitles by book number: {subtitles or '(ask me, or leave them out)'}. Voice: {voice or 'the default'}.\n"
+        "1. yoto_card_get the source (outline) and confirm which chapters are books.\n"
+        "2. Run yoto_template_book_selector with the owner account.\n"
+        "3. Show me the TTS transcripts with low matches, the simulator walks and the plan diff.\n"
+        "4. Apply only after I say yes, then confirm the read-back verified."
+    )
+
+
+@mcp.prompt(name="add-title-tracks", description="Add spoken title tracks before each book of a linear card.")
+def add_title_tracks_prompt(card: str, titles: str = "", pattern: str = r"^Book (\d+)\b") -> str:
+    return (
+        f"Add a spoken title track before each book of the Yoto card {card!r}.\n"
+        f"Book subtitles: {titles or '(ask me)'}. Chapters for book N match {pattern!r}.\n"
+        "Run yoto_template_title_tracks, show me the diff and the new intro text, and apply after I agree."
+    )
+
+
+@mcp.prompt(
+    name="audit-card", description="Check a card for foreign refs, label gaps, dead ends and stale intros."
+)
+def audit_card_prompt(card: str) -> str:
+    return (
+        f"Audit the Yoto card {card!r} without changing it.\n"
+        "- yoto_card_get (full): look for audio or icons owned by another account, labels that don't run "
+        "1..N, chapters without icons, and an intro whose spoken track numbers no longer match.\n"
+        "- If it is interactive: yoto_story_simulate with no presses and with each button, and report dead "
+        "buttons, unreachable chapters and loops.\n"
+        "Report findings as a short list, worst first, each with the fix (as plan ops) I could apply."
+    )
 
 
 def run() -> None:

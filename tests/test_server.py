@@ -25,6 +25,16 @@ EXPECTED = {
     "yoto_icon_upload",
     "yoto_icons_search",
     "yoto_cover_upload",
+    "yoto_tts",
+    "yoto_story_validate",
+    "yoto_story_compile",
+    "yoto_story_simulate",
+    "yoto_story_from_card",
+    "yoto_template_book_selector",
+    "yoto_template_title_tracks",
+    "yoto_icon_chooser",
+    "yoto_icon_select",
+    "yoto_icon_chooser_result",
 }
 
 

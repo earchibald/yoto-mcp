@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Yoto icon chooser</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1d1f; --muted: #6b6b70; --line: #e3e1dc;
+    --accent: #e8590c; --accent-ink: #ffffff; --screen: #000000; --pick: #e8590c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #151517; --panel: #1f1f22; --ink: #f2f2f3; --muted: #a0a0a8; --line: #333338; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  header { position: sticky; top: 0; z-index: 2; background: var(--bg); border-bottom: 1px solid var(--line);
+           padding: 12px 16px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  h1 { font-size: 17px; margin: 0; flex: 1 1 auto; }
+  .muted { color: var(--muted); font-size: 13px; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+           border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  input[type=search], input[type=text] { font: inherit; padding: 6px 10px; border-radius: 8px;
+           border: 1px solid var(--line); background: var(--panel); color: var(--ink); min-width: 0; }
+  main { padding: 12px 16px 80px; max-width: 980px; margin: 0 auto; }
+  .row { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px;
+         margin-bottom: 10px; display: grid; grid-template-columns: 76px 1fr; gap: 12px; }
+  .screen { width: 76px; height: 76px; background: var(--screen); border-radius: 10px;
+            display: grid; place-items: center; cursor: pointer; }
+  .screen.active { outline: 3px solid var(--pick); }
+  .screen img { width: 64px; height: 64px; image-rendering: pixelated; }
+  .screen .none { color: #777; font-size: 11px; }
+  .title { font-weight: 600; overflow-wrap: anywhere; }
+  .label { display: inline-block; min-width: 22px; padding: 0 6px; margin-right: 6px; border-radius: 6px;
+           background: var(--line); text-align: center; font-size: 12px; }
+  .cands { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .cand { width: 44px; height: 44px; padding: 4px; border-radius: 8px; background: var(--screen);
+          border: 2px solid transparent; cursor: pointer; position: relative; }
+  .cand img { width: 32px; height: 32px; image-rendering: pixelated; display: block; }
+  .cand.on { border-color: var(--pick); }
+  .cand .src { position: absolute; right: 2px; bottom: 0; font-size: 9px; color: #bbb; }
+  .tools { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  .tools input { flex: 1 1 180px; }
+  #results { display: none; background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+             padding: 12px; margin-bottom: 12px; }
+  #results.show { display: block; }
+  .toast { position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%); background: var(--ink);
+           color: var(--bg); padding: 8px 14px; border-radius: 8px; font-size: 13px; opacity: 0;
+           transition: opacity .2s; pointer-events: none; }
+  .toast.show { opacity: 1; }
+  .finished { text-align: center; padding: 40px 16px; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="heading">Choose icons</h1>
+  <input type="search" id="q" placeholder="Search Yoto icons (e.g. moon)" aria-label="Search icons">
+  <span class="muted" id="count"></span>
+  <button class="primary" id="done">Done</button>
+</header>
+<main id="main">
+  <div id="results"><div class="tools"><strong>Search results</strong><span class="muted">
+    Click a row's icon square first, then a result.</span></div><div class="cands" id="rlist"></div></div>
+  <div id="rows"><p class="muted">Loading…</p></div>
+</main>
+<div class="toast" id="toast"></div>
+<script>
+(() => {
+  const params = new URLSearchParams(location.search);
+  const browserMode = params.has("c") && params.has("t");
+  let state = null, activeRow = null, rpcId = 1;
+  const pending = new Map();
+  const picks = new Map();      // row id -> icon (yoto:# ref or a generated icon's sha256)
+  const $ = (id) => document.getElementById(id);
+  const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text; return e; };
+  const toast = (msg) => { const t = $("toast"); t.textContent = msg; t.classList.add("show");
+    clearTimeout(toast.h); toast.h = setTimeout(() => t.classList.remove("show"), 1600); };
+
+  // ---------------------------------------------------------------- transport
+  function rpc(method, p) {
+    return new Promise((resolve, reject) => {
+      const id = rpcId++;
+      pending.set(id, { resolve, reject });
+      window.parent.postMessage({ jsonrpc: "2.0", id, method, params: p }, "*");
+    });
+  }
+  function notify(method, p) { window.parent.postMessage({ jsonrpc: "2.0", method, params: p }, "*"); }
+  window.addEventListener("message", (ev) => {
+    const m = ev.data; if (!m || m.jsonrpc !== "2.0") return;
+    if (m.id !== undefined && pending.has(m.id)) {
+      const { resolve, reject } = pending.get(m.id); pending.delete(m.id);
+      return m.error ? reject(m.error) : resolve(m.result);
+    }
+    if (typeof m.method === "string" && m.method.endsWith("tool-result")) {
+      const r = m.params || {};
+      const sc = r.structuredContent || (r.result && r.result.structuredContent);
+      if (sc && sc.rows) load(sc);
+    }
+  });
+  const q = (path) => `${path}?c=${encodeURIComponent(params.get("c"))}&t=${encodeURIComponent(params.get("t"))}`;
+
+  async function save(done = false, requests = []) {
+    const selections = state.rows.map(r => ({ row: r.id, chapter_key: r.chapter_key, track_key: r.track_key,
+                                             icon: picks.get(r.id) || null }));
+    if (browserMode) {
+      await fetch(q("/select"), { method: "POST", headers: { "Content-Type": "application/json" },
+                                  body: JSON.stringify({ selections, requests, done }) });
+    } else {
+      await rpc("tools/call", { name: "yoto_icon_select",
+        arguments: { chooser_id: state.chooser_id, selections, requests, done } });
+    }
+  }
+
+  async function search(text) {
+    if (!text.trim()) return [];
+    if (browserMode) {
+      const r = await fetch(q("/search") + "&q=" + encodeURIComponent(text)); return (await r.json()).icons;
+    }
+    const r = await rpc("tools/call", { name: "yoto_icons_search", arguments: { query: text, limit: 48 } });
+    const sc = r && r.structuredContent;
+    return ((sc && sc.icons) || []).filter(i => i.ref && i.url)
+      .map(i => ({ icon: i.ref, src: i.url, source: i.source, title: i.title }));
+  }
+
+  // ---------------------------------------------------------------- rendering
+  function img(src, alt) { const i = document.createElement("img"); i.src = src; i.alt = alt || ""; return i; }
+  const candidatesOf = (row) => row.candidates.concat(row._extra || []);
+
+  function tile(row, c) {
+    const b = el("button", "cand"); b.title = `${c.title || ""} (${c.source})`;
+    b.appendChild(img(c.src, c.title));
+    b.appendChild(el("span", "src", (c.source || "?")[0]));
+    if (picks.get(row.id) === c.icon) b.classList.add("on");
+    b.onclick = () => pick(row, c);
+    return b;
+  }
+
+  function pick(row, c) {
+    if (picks.get(row.id) === c.icon) picks.delete(row.id); else picks.set(row.id, c.icon);
+    render(); save().catch(() => toast("Couldn't save; try again"));
+  }
+
+  function render() {
+    const box = $("rows"); box.textContent = "";
+    for (const row of state.rows) {
+      const section = el("section", "row");
+      const screen = el("div", "screen" + (activeRow === row ? " active" : ""));
+      screen.title = "Select this row for search results";
+      const chosen = picks.get(row.id);
+      const shown = chosen ? candidatesOf(row).find(c => c.icon === chosen) : row.current;
+      if (shown && shown.src) screen.appendChild(img(shown.src, "icon"));
+      else screen.appendChild(el("span", "none", chosen ? "picked" : "no icon"));
+      screen.onclick = () => { activeRow = row; toast(`Search results go to ${row.label}: ${row.title}`); render(); };
+      const body = el("div");
+      const t = el("div", "title"); t.append(el("span", "label", row.label), row.title); body.appendChild(t);
+      const cands = el("div", "cands");
+      const all = candidatesOf(row);
+      if (!all.length) cands.appendChild(el("span", "muted", "No suggestions. Search above, or ask Claude for one."));
+      for (const c of all) cands.appendChild(tile(row, c));
+      body.appendChild(cands);
+      const tools = el("div", "tools");
+      const every = el("button", "", "Use for every row"); every.disabled = !chosen;
+      every.onclick = () => {
+        const c = all.find(x => x.icon === chosen);
+        for (const r of state.rows) { picks.set(r.id, chosen); if (c && r !== row) r._extra = (r._extra || []).concat([c]); }
+        render(); save(); toast("Applied to every row");
+      };
+      const ask = el("input"); ask.type = "text"; ask.placeholder = "Ask Claude for another (e.g. a friendlier moon)";
+      const send = el("button", "", "Ask");
+      send.onclick = async () => {
+        if (!ask.value.trim()) return;
+        await save(false, [{ chapter_key: row.chapter_key, note: ask.value.trim() }]);
+        ask.value = ""; toast("Request saved for Claude");
+      };
+      tools.append(every, ask, send); body.appendChild(tools);
+      section.append(screen, body); box.appendChild(section);
+    }
+    $("count").textContent = `${picks.size} of ${state.rows.length} picked`;
+  }
+
+  function load(s) {
+    state = s; $("heading").textContent = `Icons for ${s.card}`;
+    for (const sel of s.selections || []) {
+      const row = s.rows.find(r => r.chapter_key === sel.chapter_key && (r.track_key || null) === (sel.track_key || null));
+      if (row) picks.set(row.id, sel.icon);
+    }
+    if (s.done) return finish();
+    render();
+  }
+
+  function finish() {
+    const main = $("main"); main.textContent = "";
+    const box = el("div", "finished");
+    box.appendChild(el("h2", "", `Saved ${picks.size} pick${picks.size === 1 ? "" : "s"}`));
+    box.appendChild(el("p", "muted", `You can close this ${browserMode ? "tab" : "panel"}. ` +
+      "Claude will show you the change before applying it."));
+    main.appendChild(box);
+    $("done").disabled = true;
+  }
+
+  $("done").onclick = async () => {
+    await save(true); finish();
+    if (!browserMode) rpc("ui/message", { role: "user", content: [{ type: "text",
+      text: `I've picked icons for ${state.card} (chooser ${state.chooser_id}).` }] }).catch(() => {});
+  };
+
+  let st;
+  $("q").addEventListener("input", (ev) => {
+    clearTimeout(st); st = setTimeout(async () => {
+      const res = $("results"), list = $("rlist");
+      const hits = await search(ev.target.value).catch(() => []);
+      list.textContent = ""; res.classList.toggle("show", hits.length > 0);
+      for (const c of hits) {
+        const b = el("button", "cand"); b.title = c.title; b.appendChild(img(c.src, c.title));
+        b.onclick = () => {
+          if (!activeRow) return toast("Click a row's icon square first");
+          activeRow._extra = (activeRow._extra || []).concat([c]); pick(activeRow, c);
+        };
+        list.appendChild(b);
+      }
+    }, 250);
+  });
+
+  // ---------------------------------------------------------------- start
+  if (browserMode) {
+    fetch(q("/state")).then(r => r.json()).then(load)
+      .catch(() => { $("rows").textContent = "This chooser link has expired."; });
+  } else {
+    rpc("ui/initialize", { protocolVersion: "2025-06-18", appInfo: { name: "yoto-icon-chooser", version: "1" },
+                           appCapabilities: {} })
+      .then(() => notify("ui/notifications/initialized", {})).catch(() => {});
+  }
+})();
+</script>
+</body>
+</html>
